@@ -1,0 +1,34 @@
+# Python/cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Large experiment artifacts
+data/
+checkpoints/
+outputs/
+wandb/
+
+# Model/data binaries
+*.pt
+*.pth
+*.ckpt
+*.model
+*.vocab
+*.tsv
+*.jsonl
+*.tgz
+*.tar
+*.gz
+*.zip
+
+# Local/editor files
+.DS_Store
+.vscode/
+.idea/

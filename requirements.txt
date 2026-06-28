@@ -1,0 +1,5 @@
+torch>=2.0
+matplotlib>=3.8
+wandb>=0.17
+sacrebleu>=2.4
+sentencepiece>=0.2
