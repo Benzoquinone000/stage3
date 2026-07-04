@@ -14,6 +14,8 @@ data/
 checkpoints/
 outputs/
 wandb/
+logs/
+tools/
 
 # Model/data binaries
 *.pt

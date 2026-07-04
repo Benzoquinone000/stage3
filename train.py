@@ -190,6 +190,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--limit", type=optional_int, default=preset["limit"])
     parser.add_argument("--max-source-len", type=int, default=preset["max_source_len"])
     parser.add_argument("--max-target-len", type=int, default=preset["max_target_len"])
+    parser.add_argument(
+        "--eval-max-source-len",
+        type=optional_int,
+        default=None,
+        help=(
+            "Optional length filter for fixed validation/test files. By default, "
+            "paper-style runs filter training only and evaluate full newstest sets."
+        ),
+    )
+    parser.add_argument(
+        "--eval-max-target-len",
+        type=optional_int,
+        default=None,
+        help=(
+            "Optional length filter for fixed validation/test files. By default, "
+            "paper-style runs filter training only and evaluate full newstest sets."
+        ),
+    )
     parser.add_argument("--min-freq", type=int, default=1)
     parser.add_argument("--max-vocab-size", type=int, default=preset["max_vocab_size"])
     parser.add_argument(
@@ -371,8 +389,8 @@ def build_dataloaders(
             source_col=source_col,
             target_col=target_col,
             limit=None,
-            max_source_len=args.max_source_len,
-            max_target_len=args.max_target_len,
+            max_source_len=args.eval_max_source_len,
+            max_target_len=args.eval_max_target_len,
             tokenizer=args.tokenizer,
         )
         test_examples = read_parallel_tsv(
@@ -380,8 +398,8 @@ def build_dataloaders(
             source_col=source_col,
             target_col=target_col,
             limit=None,
-            max_source_len=args.max_source_len,
-            max_target_len=args.max_target_len,
+            max_source_len=args.eval_max_source_len,
+            max_target_len=args.eval_max_target_len,
             tokenizer=args.tokenizer,
         )
         examples = train_examples + valid_examples + test_examples

@@ -139,13 +139,25 @@ def load_eval_examples(
     else:
         pairs_path = download_tutorial_data(data_dir)
 
+    fixed_eval = train_args.get("test_data_path") or data_path is not None
+    max_source_len = (
+        train_args.get("eval_max_source_len")
+        if fixed_eval and "eval_max_source_len" in train_args
+        else train_args.get("max_source_len")
+    )
+    max_target_len = (
+        train_args.get("eval_max_target_len")
+        if fixed_eval and "eval_max_target_len" in train_args
+        else train_args.get("max_target_len")
+    )
+
     examples = read_parallel_tsv(
         pairs_path,
         source_col=source_col,
         target_col=target_col,
         limit=None if train_args.get("test_data_path") else train_args.get("limit"),
-        max_source_len=int(train_args["max_source_len"]),
-        max_target_len=int(train_args["max_target_len"]),
+        max_source_len=None if max_source_len is None else int(max_source_len),
+        max_target_len=None if max_target_len is None else int(max_target_len),
         tokenizer=str(train_args.get("tokenizer", "legacy")),
     )
     if train_args.get("test_data_path") or data_path is not None:
