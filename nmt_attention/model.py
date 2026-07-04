@@ -42,7 +42,11 @@ class Encoder(nn.Module):
             enforce_sorted=False,
         )
         packed_outputs, hidden = self.rnn(packed)
-        outputs, _ = nn.utils.rnn.pad_packed_sequence(packed_outputs, batch_first=True)
+        outputs, _ = nn.utils.rnn.pad_packed_sequence(
+            packed_outputs,
+            batch_first=True,
+            total_length=source.shape[1],
+        )
 
         forward_final = hidden[-2]
         backward_final = hidden[-1]
@@ -151,6 +155,48 @@ class MaxoutReadout(nn.Module):
         return self.output(readout)
 
 
+class GroundHogMaxoutReadout(nn.Module):
+    """GroundHog-style deep output: summed projections followed by Maxout(2)."""
+
+    def __init__(
+        self,
+        embedding_dim: int,
+        context_dim: int,
+        hidden_dim: int,
+        output_dim: int,
+        pool_size: int = 2,
+    ) -> None:
+        super().__init__()
+        if hidden_dim % pool_size != 0:
+            raise ValueError("hidden_dim must be divisible by pool_size.")
+        self.hidden_dim = hidden_dim
+        self.pool_size = pool_size
+        self.context_readout = nn.Linear(context_dim, hidden_dim, bias=False)
+        self.hidden_readout = nn.Linear(hidden_dim, hidden_dim, bias=True)
+        self.prev_word_readout = nn.Linear(embedding_dim, hidden_dim, bias=False)
+        self.output = nn.Linear(hidden_dim // pool_size, output_dim)
+
+    def forward(
+        self,
+        embedded: torch.Tensor,
+        hidden: torch.Tensor,
+        context: torch.Tensor,
+    ) -> torch.Tensor:
+        readout = (
+            self.context_readout(context)
+            + self.hidden_readout(hidden)
+            + self.prev_word_readout(embedded)
+        )
+        batch_size = readout.shape[0]
+        readout = readout.view(
+            batch_size,
+            self.hidden_dim // self.pool_size,
+            self.pool_size,
+        )
+        readout = readout.max(dim=2).values
+        return self.output(readout)
+
+
 class Decoder(nn.Module):
     def __init__(
         self,
@@ -183,6 +229,13 @@ class Decoder(nn.Module):
                 output_dim=output_dim,
                 maxout_dim=maxout_dim or decoder_hidden_dim,
             )
+        elif readout == "groundhog":
+            self.readout = GroundHogMaxoutReadout(
+                embedding_dim=embedding_dim,
+                context_dim=context_dim,
+                hidden_dim=decoder_hidden_dim,
+                output_dim=output_dim,
+            )
         elif readout == "linear":
             self.readout = nn.Linear(
                 context_dim + decoder_hidden_dim + embedding_dim, output_dim
@@ -203,7 +256,7 @@ class Decoder(nn.Module):
         context = torch.bmm(attention_weights.unsqueeze(1), encoder_outputs).squeeze(1)
 
         hidden = self.rnn_cell(embedded, hidden, context)
-        if isinstance(self.readout, MaxoutReadout):
+        if isinstance(self.readout, (MaxoutReadout, GroundHogMaxoutReadout)):
             prediction = self.readout(embedded, hidden, context)
         else:
             prediction = self.readout(torch.cat((hidden, context, embedded), dim=1))

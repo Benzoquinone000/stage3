@@ -53,7 +53,7 @@ PRESETS: dict[str, dict[str, object]] = {
         "lr": 1.0,
         "teacher_forcing_ratio": 1.0,
         "sort_k_batches": 20,
-        "readout": "maxout",
+        "readout": "groundhog",
         "tokenizer": "whitespace",
     },
     "rtx5090": {
@@ -71,7 +71,7 @@ PRESETS: dict[str, dict[str, object]] = {
         "lr": 1.0,
         "teacher_forcing_ratio": 1.0,
         "sort_k_batches": 20,
-        "readout": "maxout",
+        "readout": "groundhog",
         "tokenizer": "whitespace",
     },
 }

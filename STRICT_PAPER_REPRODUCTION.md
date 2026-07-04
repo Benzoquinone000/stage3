@@ -110,7 +110,7 @@ python train.py \
   --clip 1.0 \
   --teacher-forcing-ratio 1.0 \
   --sort-k-batches 20 \
-  --readout maxout \
+  --readout groundhog \
   --device cuda \
   --amp \
   --checkpoint checkpoints/rnnsearch50_wmt14_wordlevel_strict.pt \

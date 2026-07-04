@@ -259,7 +259,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--sort-k-batches", type=int, default=preset["sort_k_batches"])
     parser.add_argument(
-        "--readout", choices=["maxout", "linear"], default=preset["readout"]
+        "--readout",
+        choices=["maxout", "groundhog", "linear"],
+        default=preset["readout"],
     )
     parser.add_argument("--maxout-dim", type=int, default=None)
     parser.add_argument(

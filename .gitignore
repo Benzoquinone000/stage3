@@ -16,6 +16,7 @@ outputs/
 wandb/
 logs/
 tools/
+references/
 
 # Model/data binaries
 *.pt
