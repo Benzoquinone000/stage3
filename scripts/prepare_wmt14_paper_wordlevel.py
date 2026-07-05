@@ -344,7 +344,9 @@ def main() -> None:
         "--extracted-dir", type=Path, default=Path("data/wmt14_enfr/extracted")
     )
     parser.add_argument(
-        "--work-dir", type=Path, default=Path("data/wmt14_enfr/paper_wordlevel")
+        "--work-dir",
+        type=Path,
+        default=Path("data/wmt14_enfr/paper_strict/wordlevel"),
     )
     parser.add_argument(
         "--moses-tokenizer-dir",

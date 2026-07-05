@@ -16,6 +16,8 @@ from torch.utils.data import DataLoader
 from nmt_attention.config import PRESETS
 from nmt_attention.data import (
     BucketBatchSampler,
+    IndexedBucketBatchSampler,
+    IndexedParallelTextDataset,
     ParallelTextDataset,
     TOKENIZER_CHOICES,
     Vocabulary,
@@ -185,6 +187,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional checkpoint whose model and optimizer states resume this run.",
     )
     parser.add_argument(
+        "--save-last-checkpoint",
+        action="store_true",
+        help=(
+            "Save the current epoch model even when validation loss does not "
+            "improve. Useful for per-epoch continuation evaluation."
+        ),
+    )
+    parser.add_argument(
         "--metadata", type=Path, default=Path("checkpoints/metadata.json")
     )
     parser.add_argument("--limit", type=optional_int, default=preset["limit"])
@@ -211,6 +221,52 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-freq", type=int, default=1)
     parser.add_argument("--max-vocab-size", type=int, default=preset["max_vocab_size"])
     parser.add_argument(
+        "--source-vocab-path",
+        type=Path,
+        default=None,
+        help="Optional frequency vocabulary file for the source side.",
+    )
+    parser.add_argument(
+        "--target-vocab-path",
+        type=Path,
+        default=None,
+        help="Optional frequency vocabulary file for the target side.",
+    )
+    parser.add_argument(
+        "--indexed-train-data",
+        action="store_true",
+        help=(
+            "Use an offset index for the training TSV instead of loading all "
+            "training examples into Python memory."
+        ),
+    )
+    parser.add_argument(
+        "--train-index-prefix",
+        type=Path,
+        default=None,
+        help="Optional prefix for indexed training sidecar files.",
+    )
+    parser.add_argument(
+        "--rebuild-train-index",
+        action="store_true",
+        help="Rebuild indexed training sidecar files even if matching files exist.",
+    )
+    parser.add_argument(
+        "--indexed-shuffle-buffer-size",
+        type=int,
+        default=1_000_000,
+        help="Number of indexed training rows shuffled at a time.",
+    )
+    parser.add_argument(
+        "--indexed-shuffle-once",
+        action="store_true",
+        help=(
+            "Use the same indexed shuffle order each epoch, matching the paper's "
+            "shuffle-once-then-sequential traversal more closely."
+        ),
+    )
+    parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument(
         "--tokenizer",
         choices=TOKENIZER_CHOICES,
         default=preset["tokenizer"],
@@ -232,6 +288,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="SentencePiece model used to create preprocessed TSV files.",
     )
     parser.add_argument("--batch-size", type=int, default=preset["batch_size"])
+    parser.add_argument(
+        "--eval-batch-size",
+        type=int,
+        default=None,
+        help="Optional validation/test batch size. Defaults to --batch-size.",
+    )
     parser.add_argument("--epochs", type=int, default=preset["epochs"])
     parser.add_argument(
         "--epoch-offset",
@@ -328,8 +390,24 @@ def get_data_columns(args: argparse.Namespace) -> tuple[int, int]:
 
 def build_vocabularies(
     args: argparse.Namespace,
-    train_examples: list[tuple[list[str], list[str]]],
+    train_examples: list[tuple[list[str], list[str]]] | None,
 ) -> tuple[Vocabulary, Vocabulary]:
+    if args.source_vocab_path is not None or args.target_vocab_path is not None:
+        if args.source_vocab_path is None or args.target_vocab_path is None:
+            raise ValueError("Set both --source-vocab-path and --target-vocab-path.")
+        max_words = None
+        if args.max_vocab_size is not None:
+            max_words = max(0, args.max_vocab_size - 4)
+        source_vocab = Vocabulary.from_frequency_file(args.source_vocab_path, max_words)
+        target_vocab = Vocabulary.from_frequency_file(args.target_vocab_path, max_words)
+        return source_vocab, target_vocab
+
+    if train_examples is None:
+        raise ValueError(
+            "Training examples are required to build vocabularies unless "
+            "--source-vocab-path and --target-vocab-path are set."
+        )
+
     if args.subword_type == "sentencepiece":
         if args.subword_model is None:
             raise ValueError("--subword-model is required for sentencepiece training.")
@@ -372,6 +450,95 @@ def build_dataloaders(
     int,
 ]:
     source_col, target_col = get_data_columns(args)
+    eval_batch_size = args.eval_batch_size or args.batch_size
+    if args.indexed_train_data:
+        if args.valid_data_path is None or args.test_data_path is None:
+            raise ValueError(
+                "--indexed-train-data requires fixed --valid-data-path and "
+                "--test-data-path."
+            )
+        source_vocab, target_vocab = build_vocabularies(args, None)
+        train_dataset = IndexedParallelTextDataset(
+            pairs_path,
+            source_vocab,
+            target_vocab,
+            source_col=source_col,
+            target_col=target_col,
+            limit=args.limit,
+            max_source_len=args.max_source_len,
+            max_target_len=args.max_target_len,
+            tokenizer=args.tokenizer,
+            index_prefix=args.train_index_prefix,
+            rebuild_index=args.rebuild_train_index,
+        )
+        valid_examples = read_parallel_tsv(
+            args.valid_data_path,
+            source_col=source_col,
+            target_col=target_col,
+            limit=None,
+            max_source_len=args.eval_max_source_len,
+            max_target_len=args.eval_max_target_len,
+            tokenizer=args.tokenizer,
+        )
+        test_examples = read_parallel_tsv(
+            args.test_data_path,
+            source_col=source_col,
+            target_col=target_col,
+            limit=None,
+            max_source_len=args.eval_max_source_len,
+            max_target_len=args.eval_max_target_len,
+            tokenizer=args.tokenizer,
+        )
+        if min(len(train_dataset), len(valid_examples), len(test_examples)) < 1:
+            raise ValueError(
+                "Too few examples after filtering. Relax length or limit settings."
+            )
+        valid_dataset = ParallelTextDataset(valid_examples, source_vocab, target_vocab)
+        test_dataset = ParallelTextDataset(test_examples, source_vocab, target_vocab)
+        collate_fn = make_collate_fn(source_vocab.pad_idx, target_vocab.pad_idx)
+        train_sampler = IndexedBucketBatchSampler(
+            len(train_dataset),
+            train_dataset.length_key,
+            batch_size=args.batch_size,
+            sort_k_batches=args.sort_k_batches,
+            shuffle=True,
+            seed=args.seed,
+            shuffle_buffer_size=args.indexed_shuffle_buffer_size,
+            shuffle_once=args.indexed_shuffle_once,
+        )
+        train_loader = DataLoader(
+            train_dataset,
+            batch_sampler=train_sampler,
+            collate_fn=collate_fn,
+            num_workers=args.num_workers,
+            persistent_workers=args.num_workers > 0,
+        )
+        valid_loader = DataLoader(
+            valid_dataset,
+            batch_size=eval_batch_size,
+            collate_fn=collate_fn,
+            num_workers=args.num_workers,
+            persistent_workers=args.num_workers > 0,
+        )
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=eval_batch_size,
+            collate_fn=collate_fn,
+            num_workers=args.num_workers,
+            persistent_workers=args.num_workers > 0,
+        )
+        return (
+            train_loader,
+            valid_loader,
+            test_loader,
+            source_vocab,
+            target_vocab,
+            len(train_dataset) + len(valid_dataset) + len(test_dataset),
+            len(train_dataset),
+            len(valid_dataset),
+            len(test_dataset),
+        )
+
     train_examples = read_parallel_tsv(
         pairs_path,
         source_col=source_col,
@@ -435,10 +602,10 @@ def build_dataloaders(
         collate_fn=collate_fn,
     )
     valid_loader = DataLoader(
-        valid_dataset, batch_size=args.batch_size, collate_fn=collate_fn
+        valid_dataset, batch_size=eval_batch_size, collate_fn=collate_fn
     )
     test_loader = DataLoader(
-        test_dataset, batch_size=args.batch_size, collate_fn=collate_fn
+        test_dataset, batch_size=eval_batch_size, collate_fn=collate_fn
     )
     return (
         train_loader,
@@ -628,6 +795,17 @@ def main() -> None:
 
             if valid_loss < best_valid_loss:
                 best_valid_loss = valid_loss
+                save_checkpoint(
+                    args.checkpoint,
+                    model,
+                    source_vocab,
+                    target_vocab,
+                    args,
+                    best_valid_loss,
+                    optimizer=optimizer,
+                    epoch=epoch,
+                )
+            elif args.save_last_checkpoint:
                 save_checkpoint(
                     args.checkpoint,
                     model,

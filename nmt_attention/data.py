@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import csv
+import json
 import random
 import re
 import unicodedata
+from array import array
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 import torch
 from torch.utils.data import Dataset
@@ -104,6 +106,23 @@ class Vocabulary:
                 seen.add(token)
         token_to_idx = {token: idx for idx, token in enumerate(idx_to_token)}
         return cls(token_to_idx=token_to_idx, idx_to_token=idx_to_token)
+
+    @classmethod
+    def from_frequency_file(
+        cls,
+        path: str | Path,
+        max_words: int | None = None,
+    ) -> "Vocabulary":
+        tokens: list[str] = []
+        with Path(path).open("r", encoding="utf-8", newline="\n") as file:
+            for line in file:
+                if not line.strip():
+                    continue
+                token = line.rstrip("\n").split("\t", 1)[0]
+                tokens.append(token)
+                if max_words is not None and len(tokens) >= max_words:
+                    break
+        return cls.from_tokens(tokens)
 
     @property
     def pad_idx(self) -> int:
@@ -230,6 +249,207 @@ class ParallelTextDataset(Dataset):
         )
 
 
+def default_index_prefix(path: str | Path) -> Path:
+    return Path(f"{Path(path)}.index")
+
+
+def _index_paths(prefix: Path) -> tuple[Path, Path, Path]:
+    return (
+        Path(f"{prefix}.offsets.bin"),
+        Path(f"{prefix}.lengths.bin"),
+        Path(f"{prefix}.meta.json"),
+    )
+
+
+def _read_tsv_row(line: bytes) -> list[str]:
+    return line.decode("utf-8").rstrip("\n").split("\t")
+
+
+def _index_meta_matches(
+    meta: dict[str, object],
+    path: Path,
+    source_col: int,
+    target_col: int,
+    limit: int | None,
+    max_source_len: int | None,
+    max_target_len: int | None,
+    tokenizer: str,
+) -> bool:
+    stat = path.stat()
+    return (
+        meta.get("data_path") == str(path)
+        and meta.get("size_bytes") == stat.st_size
+        and meta.get("mtime_ns") == stat.st_mtime_ns
+        and meta.get("source_col") == source_col
+        and meta.get("target_col") == target_col
+        and meta.get("limit") == limit
+        and meta.get("max_source_len") == max_source_len
+        and meta.get("max_target_len") == max_target_len
+        and meta.get("tokenizer") == tokenizer
+    )
+
+
+def build_or_load_parallel_tsv_index(
+    path: str | Path,
+    source_col: int = 0,
+    target_col: int = 1,
+    limit: int | None = None,
+    max_source_len: int | None = None,
+    max_target_len: int | None = None,
+    tokenizer: str = "legacy",
+    index_prefix: str | Path | None = None,
+    rebuild: bool = False,
+) -> tuple[array, array, dict[str, object]]:
+    data_path = Path(path)
+    prefix = Path(index_prefix) if index_prefix is not None else default_index_prefix(data_path)
+    offsets_path, lengths_path, meta_path = _index_paths(prefix)
+
+    if not rebuild and offsets_path.exists() and lengths_path.exists() and meta_path.exists():
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        if _index_meta_matches(
+            meta,
+            data_path,
+            source_col,
+            target_col,
+            limit,
+            max_source_len,
+            max_target_len,
+            tokenizer,
+        ):
+            count = int(meta["examples"])
+            offsets = array("Q")
+            lengths = array("H")
+            with offsets_path.open("rb") as offsets_file:
+                offsets.fromfile(offsets_file, count)
+            with lengths_path.open("rb") as lengths_file:
+                lengths.fromfile(lengths_file, count * 2)
+            return offsets, lengths, meta
+
+    offsets = array("Q")
+    lengths = array("H")
+    skipped = {
+        "malformed": 0,
+        "empty": 0,
+        "source_too_long": 0,
+        "target_too_long": 0,
+    }
+    with data_path.open("rb") as file:
+        while True:
+            offset = file.tell()
+            line = file.readline()
+            if not line:
+                break
+            row = _read_tsv_row(line)
+            if len(row) <= max(source_col, target_col):
+                skipped["malformed"] += 1
+                continue
+            source_tokens = tokenize(row[source_col], mode=tokenizer)
+            target_tokens = tokenize(row[target_col], mode=tokenizer)
+            if not source_tokens or not target_tokens:
+                skipped["empty"] += 1
+                continue
+            if max_source_len is not None and len(source_tokens) > max_source_len:
+                skipped["source_too_long"] += 1
+                continue
+            if max_target_len is not None and len(target_tokens) > max_target_len:
+                skipped["target_too_long"] += 1
+                continue
+            if len(source_tokens) > 65535 or len(target_tokens) > 65535:
+                raise ValueError("Indexed TSV sentence lengths must fit uint16.")
+            offsets.append(offset)
+            lengths.append(len(source_tokens))
+            lengths.append(len(target_tokens))
+            if limit is not None and len(offsets) >= limit:
+                break
+
+    prefix.parent.mkdir(parents=True, exist_ok=True)
+    with offsets_path.open("wb") as offsets_file:
+        offsets.tofile(offsets_file)
+    with lengths_path.open("wb") as lengths_file:
+        lengths.tofile(lengths_file)
+    stat = data_path.stat()
+    meta = {
+        "data_path": str(data_path),
+        "size_bytes": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+        "source_col": source_col,
+        "target_col": target_col,
+        "limit": limit,
+        "max_source_len": max_source_len,
+        "max_target_len": max_target_len,
+        "tokenizer": tokenizer,
+        "examples": len(offsets),
+        "skipped": skipped,
+        "offsets_path": str(offsets_path),
+        "lengths_path": str(lengths_path),
+    }
+    meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    return offsets, lengths, meta
+
+
+class IndexedParallelTextDataset(Dataset):
+    def __init__(
+        self,
+        path: str | Path,
+        source_vocab: Vocabulary,
+        target_vocab: Vocabulary,
+        source_col: int = 0,
+        target_col: int = 1,
+        limit: int | None = None,
+        max_source_len: int | None = None,
+        max_target_len: int | None = None,
+        tokenizer: str = "legacy",
+        index_prefix: str | Path | None = None,
+        rebuild_index: bool = False,
+    ) -> None:
+        self.path = Path(path)
+        self.source_vocab = source_vocab
+        self.target_vocab = target_vocab
+        self.source_col = source_col
+        self.target_col = target_col
+        self.tokenizer = tokenizer
+        self.offsets, self.lengths, self.index_meta = build_or_load_parallel_tsv_index(
+            self.path,
+            source_col=source_col,
+            target_col=target_col,
+            limit=limit,
+            max_source_len=max_source_len,
+            max_target_len=max_target_len,
+            tokenizer=tokenizer,
+            index_prefix=index_prefix,
+            rebuild=rebuild_index,
+        )
+        self._file = None
+
+    def __len__(self) -> int:
+        return len(self.offsets)
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_file"] = None
+        return state
+
+    def _get_file(self):
+        if self._file is None:
+            self._file = self.path.open("rb")
+        return self._file
+
+    def length_key(self, index: int) -> int:
+        length_index = index * 2
+        return max(self.lengths[length_index], self.lengths[length_index + 1])
+
+    def __getitem__(self, index: int) -> tuple[list[int], list[int]]:
+        file = self._get_file()
+        file.seek(self.offsets[index])
+        row = _read_tsv_row(file.readline())
+        source_tokens = tokenize(row[self.source_col], mode=self.tokenizer)
+        target_tokens = tokenize(row[self.target_col], mode=self.tokenizer)
+        return (
+            self.source_vocab.encode(source_tokens),
+            self.target_vocab.encode(target_tokens),
+        )
+
+
 class BucketBatchSampler(Sampler[list[int]]):
     """Approximate GroundHog's sort_k_batches padding-reduction trick."""
 
@@ -276,6 +496,57 @@ class BucketBatchSampler(Sampler[list[int]]):
 
     def __len__(self) -> int:
         return (len(self.examples) + self.batch_size - 1) // self.batch_size
+
+
+class IndexedBucketBatchSampler(Sampler[list[int]]):
+    """Bucket sampler for indexed datasets without materializing token lists."""
+
+    def __init__(
+        self,
+        size: int,
+        length_key: Callable[[int], int],
+        batch_size: int,
+        sort_k_batches: int = 20,
+        shuffle: bool = True,
+        seed: int = 13,
+        shuffle_buffer_size: int = 1_000_000,
+        shuffle_once: bool = False,
+    ) -> None:
+        self.size = size
+        self.length_key = length_key
+        self.batch_size = batch_size
+        self.sort_k_batches = max(1, sort_k_batches)
+        self.shuffle = shuffle
+        self.seed = seed
+        self.shuffle_buffer_size = max(batch_size, shuffle_buffer_size)
+        self.shuffle_once = shuffle_once
+        self.epoch = 0
+
+    def __iter__(self):
+        rng = random.Random(self.seed if self.shuffle_once else self.seed + self.epoch)
+        block_starts = list(range(0, self.size, self.shuffle_buffer_size))
+        if self.shuffle:
+            rng.shuffle(block_starts)
+        chunk_size = self.batch_size * self.sort_k_batches
+        for block_start in block_starts:
+            block_end = min(self.size, block_start + self.shuffle_buffer_size)
+            indices = array("I", range(block_start, block_end))
+            if self.shuffle:
+                rng.shuffle(indices)
+            for start in range(0, len(indices), chunk_size):
+                chunk = list(indices[start : start + chunk_size])
+                chunk.sort(key=self.length_key)
+                batch_starts = list(range(0, len(chunk), self.batch_size))
+                if self.shuffle:
+                    rng.shuffle(batch_starts)
+                for batch_start in batch_starts:
+                    batch = chunk[batch_start : batch_start + self.batch_size]
+                    if batch:
+                        yield batch
+        self.epoch += 1
+
+    def __len__(self) -> int:
+        return (self.size + self.batch_size - 1) // self.batch_size
 
 
 def pad_sequences(sequences: list[list[int]], pad_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
